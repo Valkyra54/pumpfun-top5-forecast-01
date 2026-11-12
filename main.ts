@@ -1,4 +1,4 @@
-// pumpfun-top5-forecast-01 — momentum / lifecycle forecaster v4 (Node 22, standard library only).
+// pumpfun-top5-forecast-01 — momentum / lifecycle forecaster v5 (Node 22, standard library only).
 //
 // Reads the house's 10-minute market-cap snapshots in /input (or $MAKEFUN_INPUT_DIR)
 // and writes one forecast to /output/forecast.json (or $MAKEFUN_OUTPUT_DIR):
@@ -26,6 +26,13 @@
 //     named at a place when its probability beats the unnamed per-coin share.
 //     The per-horizon deflated distributions are averaged over the reads, which
 //     is the mixture the log score rewards;
+//     Per-place the deflation is REVERSED from the v1 prior: measured on the
+//     kit history, the newcomer share of the top 5 is roughly uniform across
+//     places and if anything highest at place 1 (10-min lag: 0.50 at every
+//     place; 20-30-min lags: 1.00 at place 1, 0.33-0.50 at places 3-5), so
+//     place 1 is deflated most and place 5 least. The rate is also scaled
+//     1.25x before the cap: the fitted hazard understates churn at the
+//     30-70-minute horizons the practice reads at.
 //   - place sizes are lognormal around the simulated place caps, widened for
 //     outsider variance and model error (v1's wide sizes: v2's narrow empirical
 //     size model won on the calm kit history but lost -2.92 on the real practice
@@ -33,15 +40,6 @@
 //     place-cap drift (60-min half-life, total drift capped at +-0.2, so the
 //     shift is at most +-0.1), and the blend switches off entirely when the
 //     history has fewer than 2 mark pairs to fit the drift from.
-//   - v4: the lower-place size centers are anchored to the place-1 center
-//     (place k sits 0.08*k below place 1). Diagnosis: in the history the top 5
-//     caps are tightly compressed (places 2-5 within ~0.3 log of place 1 — the
-//     top 5 is a rotating cast of freshly pumped coins), while the Monte Carlo's
-//     lower-place caps spread far below place 1 because it simulates incumbents
-//     decaying apart. The old centers sat up to +1.1 sd below the actual caps
-//     for places 3-5, and the bias grew with horizon. Anchoring fixes that;
-//     the sd floor is 0.30 now that the centers are right (0.35 was paying for
-//     the center error).
 //
 // Fully deterministic: the PRNG is seeded from a hash of the input, no clock,
 // no Math.random. Two runs on the same history write byte-identical output.
@@ -65,12 +63,12 @@ const MOMENTUM_WEIGHT = 0.35; // how much of a coin's own recent slope survives 
 const MOMENTUM_HALF_MIN = 60; // momentum fades after this many minutes of horizon
 const MOMENTUM_DAMP = 0.5; // momentum is noisy: damp it
 const OUTSIDER_Q_CAP = 0.65; // max share of a place left to post-cut coins
-const OUTSIDER_PLACE_MULT = [0.7, 0.85, 1.0, 1.15, 1.25]; // newcomers take lower places more often
+const OUTSIDER_PLACE_MULT = [1.4, 1.2, 1.0, 0.8, 0.6]; // measured: newcomers take place 1 as often as (or more often than) lower places — deflate place 1 most, place 5 least (v5; v1's [0.7..1.25] ramp assumed the opposite and cost order on every backtest split)
+const Q_MULT = 1.25; // scales the outsider rate before the cap (v5; the fitted hazard understates churn at 30-70-min horizons)
 const OUTSIDER_HALF_LIFE_MIN = 30; // recency half-life for the newcomer-hazard fit
-const SIZE_SD_MIN = 0.30; // never narrower than this (v4: centers are anchored, so 0.30 is safe)
+const SIZE_SD_MIN = 0.35; // never narrower than the house baseline's size sd
 const SIZE_SD_WIDEN = 1.25; // widen simulated place-cap sd for outsiders + model error
 const SIZE_MEAN_SHIFT = 0.05; // outsiders push true place caps above the simulated ones
-const SIZE_COMPRESS_GAP = 0.08; // place k's size center sits this far below place 1's, per place (v4 anchor)
 const SIZE_BLEND_W = 0.5; // weight of the empirical center in the blended size center
 const SIZE_EMP_HALF_LIFE_MIN = 60; // recency half-life for the empirical drift fit
 const SIZE_EMP_DRIFT_STEP_CAP = 0.05; // cap on |per-10-min place-cap drift|
@@ -260,7 +258,7 @@ let lambda = 0.02; // per minute, prior
   }
 }
 lambda = Math.min(Math.max(lambda, 0.005), 0.02);
-const qAtHorizon = (hMin: number): number => Math.min(1 - Math.exp(-lambda * hMin), OUTSIDER_Q_CAP);
+const qAtHorizon = (hMin: number): number => Math.min(Q_MULT * (1 - Math.exp(-lambda * hMin)), OUTSIDER_Q_CAP);
 
 /* ---------------- empirical place-cap drift (center only, heavily damped) ---------------- */
 // Consecutive-mark changes of each place's cap, recency-weighted with a LONG
@@ -444,7 +442,6 @@ for (let k = 0; k < PLACES; k++) {
 
 /* ---------------- sizes from simulated place caps ---------------- */
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
-let place1Mean = 0; // v4 anchor: lower-place centers sit just below place 1's
 for (let k = 0; k < PLACES; k++) {
   const s = placeCapSamples[k]!;
   if (s.length === 0) continue;
@@ -456,9 +453,7 @@ for (let k = 0; k < PLACES; k++) {
     const driftCapped = Math.min(Math.max(driftTotal, -SIZE_EMP_DRIFT_TOTAL_CAP), SIZE_EMP_DRIFT_TOTAL_CAP);
     empCenter += (placeCapLast[k]! + driftCapped) / H;
   }
-  let mean = (1 - blendW) * mcMean + blendW * empCenter + SIZE_MEAN_SHIFT;
-  if (k === 0) place1Mean = mean;
-  else mean = place1Mean - SIZE_COMPRESS_GAP * k;
+  const mean = (1 - blendW) * mcMean + blendW * empCenter + SIZE_MEAN_SHIFT;
   const sdRaw = Math.sqrt(s.reduce((a, b) => a + (b - mcMean) ** 2, 0) / s.length);
   const sd = Math.max(sdRaw * SIZE_SD_WIDEN, SIZE_SD_MIN);
   // Name bins greedily by p, only while a bin's p beats the unnamed per-bin
