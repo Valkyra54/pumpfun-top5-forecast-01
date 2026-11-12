@@ -1,4 +1,4 @@
-// pumpfun-top5-forecast-01 — momentum / lifecycle forecaster (Node 22, standard library only).
+// pumpfun-top5-forecast-01 — momentum / lifecycle forecaster v2 (Node 22, standard library only).
 //
 // Reads the house's 10-minute market-cap snapshots in /input (or $MAKEFUN_INPUT_DIR)
 // and writes one forecast to /output/forecast.json (or $MAKEFUN_OUTPUT_DIR):
@@ -16,14 +16,21 @@
 //     age-band drift over the horizon, plus a damped momentum term that fades
 //     after 60 minutes; volatility grows with the horizon;
 //   - a seeded Monte Carlo (deterministic given the input) simulates the candidate
-//     set at every answer read, ranks it, and averages place probabilities and
-//     place-cap distributions over the reads;
+//     set at every answer read, ranks it, and records place probabilities PER
+//     horizon;
 //   - coins born after the history ends cannot be named, so each place's named
 //     probabilities are deflated by an outsider rate fitted from the history's own
-//     newcomer churn, leaving the rest unnamed for them; a coin is only named at
-//     a place when its probability beats the unnamed per-coin share.
-//   - place sizes are lognormal around the simulated place caps, widened for
-//     outsider variance and model error.
+//     newcomer churn — per horizon, with the newcomer hazard fitted from the
+//     RECENT mark pairs (the chart matures fast: early cuts are hyper-churny,
+//     later cuts are stable), leaving the rest unnamed for them; a coin is only
+//     named at a place when its probability beats the unnamed per-coin share.
+//     The per-horizon deflated distributions are averaged over the reads, which
+//     is the mixture the log score rewards;
+//   - place sizes come from an EMPIRICAL place-cap model, not the Monte Carlo's
+//     order statistics: each place's cap is tracked across marks, its recent
+//     per-10-minute drift and volatility are fitted (recency-weighted), the mean
+//     is extrapolated to each read with a saturating drift, and the bin
+//     probabilities are the mixture over reads.
 //
 // Fully deterministic: the PRNG is seeded from a hash of the input, no clock,
 // no Math.random. Two runs on the same history write byte-identical output.
@@ -39,8 +46,8 @@ const MAX_CANDIDATES = 350; // coins simulated
 const MC_DRAWS_TARGET = 3_000_000; // paths * candidates * horizons, roughly
 const MIN_PATHS = 400;
 const MAX_PATHS = 5000;
-const SIGMA0 = 0.2; // base uncertainty at the cut (log10)
-const SIGMA_MIN = 0.25; // per-coin sigma floor at any horizon
+const SIGMA0 = 0.1; // base uncertainty at the cut (log10)
+const SIGMA_MIN = 0.15; // per-coin sigma floor at any horizon
 const SIGMA_MAX = 1.2; // per-coin sigma cap
 const CURVE_SIGMA_BONUS = 0.15; // curve coins are bimodal (die or graduate+pump)
 const MOMENTUM_WEIGHT = 0.35; // how much of a coin's own recent slope survives shrinkage
@@ -48,9 +55,16 @@ const MOMENTUM_HALF_MIN = 60; // momentum fades after this many minutes of horiz
 const MOMENTUM_DAMP = 0.5; // momentum is noisy: damp it
 const OUTSIDER_Q_CAP = 0.65; // max share of a place left to post-cut coins
 const OUTSIDER_PLACE_MULT = [0.7, 0.85, 1.0, 1.15, 1.25]; // newcomers take lower places more often
-const SIZE_SD_MIN = 0.35; // never narrower than the house baseline's size sd
-const SIZE_SD_WIDEN = 1.25; // widen simulated place-cap sd for outsiders + model error
-const SIZE_MEAN_SHIFT = 0.05; // outsiders push true place caps above the simulated ones
+const OUTSIDER_HALF_LIFE_MIN = 30; // recency half-life for the newcomer-hazard fit
+const SIZE_SIGMA0 = 0.05; // place-cap sd at the cut
+const SIZE_SD_MIN = 0.08; // narrowest place-cap sd at any horizon
+const SIZE_SD_MAX = 0.5; // widest place-cap sd at any horizon
+const SIZE_SD_STEP_MIN = 0.05; // floor on the fitted per-10-min place-cap change sd
+const SIZE_SD_STEP_MAX = 0.3; // cap on the fitted per-10-min place-cap change sd
+const SIZE_DRIFT_STEP_CAP = 0.15; // cap on |per-10-min place-cap drift|
+const SIZE_DRIFT_TAU_MIN = 90; // drift saturates over this timescale
+const SIZE_DRIFT_TOTAL_CAP = 0.5; // cap on |total drift applied|
+const SIZE_DRIFT_HALF_LIFE_MIN = 3; // recency half-life for the drift fit
 const MICRO = 1_000_000;
 
 /* ---------------- deterministic PRNG ---------------- */
@@ -206,32 +220,91 @@ function bucketStats(venue: string, band: number): { mean: number; sd: number } 
   return venue === 'pool' ? { mean: 0.02, sd: 0.15 } : { mean: -0.01, sd: 0.12 };
 }
 
-/* ---------------- outsider rate from newcomer churn ---------------- */
-// For mark pairs (i, j), j > i, the share of the top 5 at j born after mark i's
-// time. Fit q(dt) = 1 - exp(-lambda * dt) through the mean point, capped.
-let pairQ = 0, pairN = 0, pairDt = 0;
-for (let i = 1; i < marks.length; i++) {
-  const tI = Date.parse(marks[i]!.at);
-  const top100I = new Set(marks[i]!.rows!.slice(0, 100).map((r) => r.mint));
-  void top100I;
-  for (let j = i + 1; j < marks.length; j++) {
-    const dt = (Date.parse(marks[j]!.at) - tI) / 60000;
+/* ---------------- outsider hazard: recency-weighted fit per cut ---------------- */
+// For each consecutive mark pair, the share of the top 5 at the later mark born
+// after the earlier mark's time. The newcomer hazard is fitted from these
+// per-10-minute shares, recency-weighted (the chart matures fast, so recent
+// pairs describe the current regime and old pairs describe a dead one).
+let lambda = 0.02; // per minute, prior
+{
+  let wSum = 0, mSum = 0, dtSum = 0;
+  for (let i = 0; i < marks.length - 1; i++) {
+    const tI = Date.parse(marks[i]!.at);
+    const tJ = Date.parse(marks[i + 1]!.at);
+    const dt = (tJ - tI) / 60000;
+    if (dt <= 0) continue;
     let newcomers = 0;
-    for (const r of marks[j]!.rows!.slice(0, PLACES)) {
+    for (const r of marks[i + 1]!.rows!.slice(0, PLACES)) {
       if (Date.parse(r.created_at) > tI) newcomers++;
     }
-    pairQ += newcomers / PLACES; pairN++; pairDt += dt;
+    const share = newcomers / PLACES;
+    const ageMin = (cutTime - tJ) / 60000;
+    const w = Math.pow(0.5, ageMin / Math.max(1, OUTSIDER_HALF_LIFE_MIN));
+    wSum += w; mSum += w * share; dtSum += w * dt;
+  }
+  if (wSum > 0) {
+    const meanShare = mSum / wSum;
+    const meanDt = dtSum / wSum;
+    if (meanShare > 0.02 && meanShare < 0.95 && meanDt > 0) lambda = -Math.log(1 - meanShare) / meanDt;
   }
 }
-let lambda = 0.02; // per minute, prior
-if (pairN > 0) {
-  const meanQ = pairQ / pairN;
-  const meanDt = pairDt / pairN;
-  if (meanQ > 0.02 && meanQ < 0.95 && meanDt > 0) lambda = -Math.log(1 - meanQ) / meanDt;
+lambda = Math.min(Math.max(lambda, 0.005), 0.02);
+const qAtHorizon = (hMin: number): number => Math.min(1 - Math.exp(-lambda * hMin), OUTSIDER_Q_CAP);
+
+/* ---------------- empirical place-cap drift / volatility ---------------- */
+// Consecutive-mark changes of each place's cap, recency-weighted. The place cap
+// is far more stable than any single coin: it grows as newcomers arrive and
+// falls only when the whole chart decays.
+const placeCapLast: number[] = lastRows.slice(0, PLACES).map((r) => logcapOf(r));
+const placeDrift: number[] = new Array(PLACES).fill(0);
+let placeSdStep = 0.12; // per-10-min sd of place-cap changes, prior
+{
+  // per-place recency-weighted mean change per 10 minutes
+  for (let k = 0; k < PLACES; k++) {
+    let wSum = 0, dSum = 0;
+    for (let i = 0; i < marks.length - 1; i++) {
+      const rowsI = marks[i]!.rows!;
+      const rowsJ = marks[i + 1]!.rows!;
+      if (rowsI.length <= k || rowsJ.length <= k) continue;
+      const dtMin = (Date.parse(marks[i + 1]!.at) - Date.parse(marks[i]!.at)) / 60000;
+      if (dtMin <= 0) continue;
+      const d = (logcapOf(rowsJ[k]!) - logcapOf(rowsI[k]!)) / (dtMin / 10);
+      const w = Math.pow(0.5, ((cutTime - Date.parse(marks[i + 1]!.at)) / 60000) / Math.max(1, SIZE_DRIFT_HALF_LIFE_MIN));
+      wSum += w; dSum += w * d;
+    }
+    if (wSum > 0) {
+      // shrink toward the pooled drift (all places) when the sample is thin
+      placeDrift[k] = Math.min(Math.max(dSum / wSum, -SIZE_DRIFT_STEP_CAP), SIZE_DRIFT_STEP_CAP);
+    }
+  }
+  // pooled drift (for shrinkage) and pooled sd of the changes
+  let wSum = 0, dSum = 0, sqSum = 0, nPairs = 0;
+  for (let i = 0; i < marks.length - 1; i++) {
+    const rowsI = marks[i]!.rows!;
+    const rowsJ = marks[i + 1]!.rows!;
+    const dtMin = (Date.parse(marks[i + 1]!.at) - Date.parse(marks[i]!.at)) / 60000;
+    if (dtMin <= 0) continue;
+    if (rowsI.length > 0 && rowsJ.length > 0) nPairs++;
+    for (let k = 0; k < Math.min(PLACES, rowsI.length, rowsJ.length); k++) {
+      const d = (logcapOf(rowsJ[k]!) - logcapOf(rowsI[k]!)) / (dtMin / 10);
+      const w = Math.pow(0.5, ((cutTime - Date.parse(marks[i + 1]!.at)) / 60000) / Math.max(1, SIZE_DRIFT_HALF_LIFE_MIN));
+      wSum += w; dSum += w * d; sqSum += w * d * d;
+    }
+  }
+  if (wSum > 0) {
+    const pooledDrift = Math.min(Math.max(dSum / wSum, -SIZE_DRIFT_STEP_CAP), SIZE_DRIFT_STEP_CAP);
+    const pooledVar = Math.max(sqSum / wSum - pooledDrift * pooledDrift, 0.0025);
+    placeSdStep = Math.min(Math.max(Math.sqrt(pooledVar), SIZE_SD_STEP_MIN), SIZE_SD_STEP_MAX);
+    // shrink each place's drift 50% toward the pooled drift (few pairs per place)
+    for (let k = 0; k < PLACES; k++) placeDrift[k] = 0.5 * placeDrift[k]! + 0.5 * pooledDrift;
+  }
+  // Thin history: with almost no pairs the drift is a guess, so trust it less
+  // (shrink toward 0) and widen the sd to admit the ignorance.
+  if (nPairs < 3) {
+    for (let k = 0; k < PLACES; k++) placeDrift[k] = 0.5 * placeDrift[k]!;
+    placeSdStep = Math.max(placeSdStep, 0.25);
+  }
 }
-lambda = Math.min(Math.max(lambda, 0.005), 0.06);
-const meanHorizon = horizonsMin.reduce((a, b) => a + b, 0) / H;
-const qBase = Math.min(1 - Math.exp(-lambda * meanHorizon), OUTSIDER_Q_CAP);
 
 /* ---------------- candidate selection ---------------- */
 function recentSlope(c: Coin): number {
@@ -292,23 +365,25 @@ for (const cd of cands) {
   }
 }
 
-/* ---------------- Monte Carlo over candidates ---------------- */
+/* ---------------- Monte Carlo over candidates (per horizon) ---------------- */
 const NC = cands.length;
 const paths = Math.min(MAX_PATHS, Math.max(MIN_PATHS, Math.floor(MC_DRAWS_TARGET / Math.max(1, NC * H))));
 const seedStr = lastRows.map((r) => r.mint).join(',') + '|' + task.t0 + '|' + horizonsMin.join(',');
 const rand = mulberry32(fnv1a(seedStr));
 const gauss = makeNormal(rand);
-const placeProb = new Float64Array(NC * PLACES); // [coin * PLACES + place]
-const placeCapSamples: number[][] = Array.from({ length: PLACES }, () => []);
+// placeProbH[hj][coin * PLACES + place]: raw MC place probabilities at horizon hj
+const placeProbH: Float64Array[] = [];
 const muArr: Float64Array[] = [];
 const sdArr: Float64Array[] = [];
 for (let hj = 0; hj < H; hj++) {
   muArr.push(Float64Array.from(cands.map((c) => c.mu[hj]!)));
   sdArr.push(Float64Array.from(cands.map((c) => c.sigma[hj]!)));
+  placeProbH.push(new Float64Array(NC * PLACES));
 }
 const draw = new Float64Array(NC);
 for (let hj = 0; hj < H; hj++) {
   const mu = muArr[hj]!, sd = sdArr[hj]!;
+  const pp = placeProbH[hj]!;
   for (let p = 0; p < paths; p++) {
     for (let i = 0; i < NC; i++) draw[i] = mu[i]! + sd[i]! * gauss();
     // top 5 by linear scan
@@ -326,21 +401,29 @@ for (let hj = 0; hj < H; hj++) {
     }
     for (let k = 0; k < PLACES; k++) {
       const idx = topIdx[k]!;
-      if (idx >= 0) {
-        placeProb[idx * PLACES + k]! += 1 / paths / H;
-        placeCapSamples[k]!.push(topVal[k]!);
-      }
+      if (idx >= 0) pp[idx * PLACES + k]! += 1 / paths;
     }
   }
 }
 
-/* ---------------- deflate by the outsider rate, pick named sets ---------------- */
+/* ---------------- deflate per horizon, average over reads ---------------- */
+// The forecast is one distribution scored at every read; the log score is
+// maximised by the mixture (mean) of the per-read distributions.
+const placeProb = new Float64Array(NC * PLACES);
+for (let hj = 0; hj < H; hj++) {
+  const qh = qAtHorizon(horizonsMin[hj]!);
+  const pp = placeProbH[hj]!;
+  for (let k = 0; k < PLACES; k++) {
+    const deflate = 1 - Math.min(qh * OUTSIDER_PLACE_MULT[k]!, 0.8);
+    for (let i = 0; i < NC; i++) placeProb[i * PLACES + k]! += (pp[i * PLACES + k]! * deflate) / H;
+  }
+}
+
+/* ---------------- pick named sets ---------------- */
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
 for (let k = 0; k < PLACES; k++) {
-  const qk = Math.min(qBase * OUTSIDER_PLACE_MULT[k]!, 0.8);
-  const deflate = 1 - qk;
-  // candidates sorted by deflated probability at this place
-  const order = cands.map((c, i) => ({ i, p: placeProb[i * PLACES + k]! * deflate })).sort((a, b) => b.p - a.p);
+  // candidates sorted by probability at this place
+  const order = cands.map((c, i) => ({ i, p: placeProb[i * PLACES + k]! })).sort((a, b) => b.p - a.p);
   // greedy named set: name a coin only while its p beats the unnamed per-coin share
   let named: Array<{ i: number; p: number }> = [];
   let unnamed = 1;
@@ -365,22 +448,30 @@ for (let k = 0; k < PLACES; k++) {
   }
 }
 
-/* ---------------- sizes from simulated place caps ---------------- */
+/* ---------------- sizes from the empirical place-cap model ---------------- */
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
 for (let k = 0; k < PLACES; k++) {
-  const s = placeCapSamples[k]!;
-  if (s.length === 0) continue;
-  const mean = s.reduce((a, b) => a + b, 0) / s.length + SIZE_MEAN_SHIFT;
-  const sdRaw = Math.sqrt(s.reduce((a, b) => a + (b - (mean - SIZE_MEAN_SHIFT)) ** 2, 0) / s.length);
-  const sd = Math.max(sdRaw * SIZE_SD_WIDEN, SIZE_SD_MIN);
+  // mixture over reads of the per-read bin probabilities
+  const binP = new Float64Array(EDGES.length + 1);
+  for (const h of horizonsMin) {
+    // saturating drift: grows linearly at first, then flattens
+    const driftTotal = placeDrift[k]! * SIZE_DRIFT_TAU_MIN * (1 - Math.exp(-h / SIZE_DRIFT_TAU_MIN)) / 10;
+    const driftCapped = Math.min(Math.max(driftTotal, -SIZE_DRIFT_TOTAL_CAP), SIZE_DRIFT_TOTAL_CAP);
+    const mean = placeCapLast[k]! + driftCapped;
+    const steps = Math.max(1, h / 10);
+    const sd = Math.min(Math.max(Math.sqrt(placeSdStep * placeSdStep * steps + SIZE_SIGMA0 * SIZE_SIGMA0), SIZE_SD_MIN), SIZE_SD_MAX);
+    for (let bin = 0; bin <= EDGES.length; bin++) {
+      const lo = bin === 0 ? -Infinity : EDGES[bin - 1]!;
+      const hi = bin === EDGES.length ? Infinity : EDGES[bin]!;
+      binP[bin]! += (above(lo, mean, sd) - above(hi, mean, sd)) / H;
+    }
+  }
   // Name bins greedily by p, only while a bin's p beats the unnamed per-bin
   // share; a tail bin left unnamed scores (1 - sum) / (82 - named) instead of
   // a floored ln, so naming a bin below that share hurts.
   const allBins: Array<{ bin: number; p: number }> = [];
   for (let bin = 0; bin <= EDGES.length; bin++) {
-    const lo = bin === 0 ? -Infinity : EDGES[bin - 1]!;
-    const hi = bin === EDGES.length ? Infinity : EDGES[bin]!;
-    const u = Math.floor((above(lo, mean, sd) - above(hi, mean, sd)) * MICRO);
+    const u = Math.floor(binP[bin]! * MICRO);
     if (u > 0) allBins.push({ bin, p: u / MICRO });
   }
   allBins.sort((a, b) => b.p - a.p);
@@ -407,7 +498,7 @@ for (let k = 0; k < PLACES; k++) {
 const expRank = cands.map((c, i) => {
   let e = 0, mass = 0;
   for (let k = 0; k < PLACES; k++) {
-    const p = placeProb[i * PLACES + k]! * (1 - Math.min(qBase * OUTSIDER_PLACE_MULT[k]!, 0.8));
+    const p = placeProb[i * PLACES + k]!;
     e += (k + 1) * p; mass += p;
   }
   e += (PLACES + 1) * (1 - mass);
